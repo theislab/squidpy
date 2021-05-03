@@ -30,12 +30,12 @@ import xarray as xr
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-from imageio import imread
 from skimage.util import img_as_float
 from skimage.transform import rescale
 
 from squidpy._docs import d
 from squidpy._utils import singledispatchmethod
+from squidpy.im._io import _lazy_load_image
 from squidpy.gr._utils import (
     _assert_in_range,
     _assert_positive,
@@ -43,13 +43,11 @@ from squidpy.gr._utils import (
     _assert_spatial_basis,
     _assert_non_empty_sequence,
 )
-from squidpy.im._utils import (
-    _num_pages,
+from squidpy.im._coords import (
     CropCoords,
     CropPadding,
     _NULL_COORDS,
     _NULL_PADDING,
-    _open_rasterio,
     TupleSerializer,
 )
 from squidpy.im._feature_mixin import FeatureMixin
@@ -80,6 +78,9 @@ class ImageContainer(FeatureMixin):
     Parameters
     ----------
     %(add_img.parameters)s
+    scale
+        Scalefactor of the image with respect to the spatial coords saved in
+        the accompanying :class:`ad.AnnData`.
 
     Raises
     ------
@@ -90,12 +91,13 @@ class ImageContainer(FeatureMixin):
         self,
         img: Optional[Input_t] = None,
         layer: str = "image",
+        scale: float = 1.0,
         **kwargs: Any,
     ):
         self._data: xr.Dataset = xr.Dataset()
         self._data.attrs[Key.img.coords] = _NULL_COORDS  # can't save None to NetCDF
         self._data.attrs[Key.img.padding] = _NULL_PADDING
-        self._data.attrs[Key.img.scale] = 1
+        self._data.attrs[Key.img.scale] = scale
         self._data.attrs[Key.img.mask_circle] = False
 
         chunks = kwargs.pop("chunks", None)
@@ -246,8 +248,8 @@ class ImageContainer(FeatureMixin):
 
         suffix = img.suffix.lower()
 
-        if suffix in (".jpg", ".jpeg"):
-            return self._load_img(imread(str(img)))
+        if suffix in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+            return _lazy_load_image(img, chunks=None)
 
         if img.is_dir():
             if len(self._data):
@@ -262,19 +264,6 @@ class ImageContainer(FeatureMixin):
 
             self._data = transform_metadata(xr.open_dataset(img, chunks=chunks))
             return None
-
-        if suffix in (".tif", ".tiff"):
-            # calling _load_img ensures we can safely do the transpose
-            return self._load_img(
-                xr.concat(
-                    [
-                        _open_rasterio(f"GTIFF_DIR:{i}:{img}", chunks=chunks, parse_coordinates=False)
-                        for i in range(1, _num_pages(img) + 1)
-                    ],
-                    dim="band",
-                ),
-                copy=False,
-            ).transpose("y", "x", ...)
 
         raise ValueError(f"Unknown suffix `{img.suffix}`.")
 
@@ -322,6 +311,7 @@ class ImageContainer(FeatureMixin):
         self,
         y: FoI_t,
         x: FoI_t,
+        library_id: Optional[str] = None,
         size: Optional[Union[FoI_t, Tuple[FoI_t, FoI_t]]] = None,
         scale: float = 1.0,
         cval: Union[int, float] = 0,
@@ -334,6 +324,8 @@ class ImageContainer(FeatureMixin):
         Parameters
         ----------
         %(yx)s
+        library_id
+            Name of the z dim that is returned. If None, all z dims are returned
         %(size)s
         scale
             Rescale the crop using :func:`skimage.transform.rescale`.
@@ -384,8 +376,9 @@ class ImageContainer(FeatureMixin):
             raise ValueError("Width of the crop is empty.")
 
         crop = self.data.isel(x=slice(coords.x0, coords.x1), y=slice(coords.y0, coords.y1)).copy(deep=False)
+        if len(crop.z) > 1 and library_id is not None:
+            crop = crop.where(crop.library_id == library_id, drop=True)
         crop.attrs[Key.img.coords] = coords
-
         if orig != coords:
             padding = orig - coords
 
@@ -396,7 +389,6 @@ class ImageContainer(FeatureMixin):
                         cval = 0
                 else:
                     crop[key] = crop[key].astype(np.dtype(type(cval)), copy=False)
-
             crop = crop.pad(
                 y=(padding.y_pre, padding.y_post),
                 x=(padding.x_pre, padding.x_post),
@@ -559,6 +551,8 @@ class ImageContainer(FeatureMixin):
         %(adata)s
         library_id
             Key in :attr:`anndata.AnnData.uns` ``['{spatial_key}']`` used to get the spot diameter.
+            If none, there should either only exist one entry in  :attr:`anndata.AnnData.uns` ``['{spatial_key}']``,
+            or a column :attr:`anndata.AnnData.obs` ``['library_id']`` containing the mapping from obs to library ids.
         %(spatial_key)s
         spot_scale
             Scaling factor for the spot diameter. Larger values mean more context.
@@ -578,20 +572,36 @@ class ImageContainer(FeatureMixin):
         self._assert_not_empty()
         _assert_positive(spot_scale, name="scale")
         _assert_spatial_basis(adata, spatial_key)
-        library_id = Key.uns.library_id(adata, spatial_key=spatial_key, library_id=library_id)
 
+        # limit to obs_names
         if obs_names is None:
             obs_names = adata.obs_names
         obs_names = _assert_non_empty_sequence(obs_names, name="observations")
-
         adata = adata[obs_names, :]
+
+        # get library_id
+        if len(self.data.z) > 1 and library_id is None:
+            # assign from adata TODO raise nicer error message if not exists
+            library_ids = adata.obs["library_id"]
+        else:
+            if len(self.data.z):
+                logg.warning(
+                    f"ImageContainer has {len(self.data.z)} z dimensions, \
+                    will use library_id {library_id} for all of them."
+                )
+            library_id = Key.uns.library_id(adata, spatial_key=spatial_key, library_id=library_id)
+            library_ids = [library_id] * len(adata.obs)
+
         spatial = adata.obsm[spatial_key][:, :2]
 
-        diameter = adata.uns[spatial_key][library_id]["scalefactors"]["spot_diameter_fullres"]
-        radius = int(round(diameter // 2 * spot_scale))
-
         for i, obs in enumerate(adata.obs_names):
-            crop = self.crop_center(y=spatial[i][1], x=spatial[i][0], radius=radius, **kwargs)
+            # TODO use scale attr here to scale higres coords + diameter
+            s = self.data.attrs["scale"]
+            diameter = adata.uns[spatial_key][library_ids[i]]["scalefactors"]["spot_diameter_fullres"] * s
+            radius = int(round(diameter // 2 * spot_scale))
+            crop = self.crop_center(
+                y=int(spatial[i][1] * s), x=int(spatial[i][0] * s), radius=radius, library_id=library_ids[i], **kwargs
+            )
             crop.data.attrs[Key.img.obs] = obs
             crop = crop._maybe_as_array(as_array)
 
