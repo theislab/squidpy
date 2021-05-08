@@ -1,4 +1,4 @@
-name: CI
+eame: CI
 
 on:
     schedule:
